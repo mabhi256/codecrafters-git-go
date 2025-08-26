@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -38,7 +39,7 @@ func uncompressObject(hash string) ([]byte, error) {
 	return blob, nil
 }
 
-func compressContent(content []byte) (string, error) {
+func compressContent(content []byte) ([]byte, error) {
 	// calculate SHA-1 of the uncompressed content
 	hashBytes := sha1.Sum(content)
 	hashString := fmt.Sprintf("%x", hashBytes)
@@ -48,30 +49,30 @@ func compressContent(content []byte) (string, error) {
 	writer := zlib.NewWriter(&buf)
 	_, err := writer.Write(content)
 	if err != nil {
-		return "", fmt.Errorf("error compressing content: %w", err)
+		return nil, fmt.Errorf("error compressing content: %w", err)
 	}
 
 	err = writer.Close()
 	if err != nil {
-		return "", fmt.Errorf("error closing zlib writer: %w", err)
+		return nil, fmt.Errorf("error closing zlib writer: %w", err)
 	}
 
 	// create the read-only blob file with the zlib compressed
 	blobDir := filepath.Join(".git/objects", hashString[:2])
 	if err := os.MkdirAll(blobDir, 0755); err != nil {
-		return "", fmt.Errorf("error creating blob directory: %w", err)
+		return nil, fmt.Errorf("error creating blob directory: %w", err)
 	}
 
 	blobFile := filepath.Join(blobDir, hashString[2:])
 	compressedContent := buf.Bytes()
 	if err := os.WriteFile(blobFile, compressedContent, 0444); err != nil {
-		return "", fmt.Errorf("error writing to blob file: %w", err)
+		return nil, fmt.Errorf("error writing to blob file: %w", err)
 	}
 
-	return fmt.Sprintf("%x", hashBytes), nil
+	return hashBytes[:], nil
 }
 
-func RunLsTree(treeSha string, isNameOnly bool) {
+func GetTreeObject(treeSha string, isNameOnly bool) {
 	blob, err := uncompressObject(treeSha)
 	if err != nil {
 		handleErr("Failed to uncompress object %s: %v\n", treeSha, err)
@@ -120,10 +121,77 @@ func RunLsTree(treeSha string, isNameOnly bool) {
 	}
 }
 
-func RunHashObject(fileName string) {
+func CreateTreeObject(path string) ([]byte, error) {
+	var objectBytes []byte
+
+	// Read directory contents
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort entries by name
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".git") {
+			continue
+		}
+
+		entryPath := filepath.Join(path, entry.Name())
+
+		var hashBytes []byte
+		if entry.IsDir() {
+			// Recursively handle subdirectory
+			hashBytes, err = CreateTreeObject(entryPath)
+		} else {
+			// Handle regular file
+			hashBytes, err = CreateBlobObject(entryPath)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		entryHeader := fmt.Sprintf("%s %s\x00", getFileMode(entry), entry.Name())
+		objectBytes = append(objectBytes, []byte(entryHeader)...)
+		objectBytes = append(objectBytes, hashBytes...)
+	}
+
+	header := fmt.Sprintf("tree %d\x00", len(objectBytes))
+	content := []byte(header)
+	content = append(content, objectBytes...)
+
+	hash, err := compressContent(content)
+	if err != nil {
+		return nil, err
+	}
+
+	return []byte(hash), nil
+}
+
+func getFileMode(entry os.DirEntry) string {
+	if entry.IsDir() {
+		return "40000"
+	}
+
+	if entry.Type()&os.ModeSymlink != 0 {
+		return "120000"
+	}
+
+	if fileInfo, err := entry.Info(); err == nil && fileInfo.Mode()&0111 != 0 {
+		return "100755"
+	}
+
+	return "100644"
+}
+
+func CreateBlobObject(fileName string) ([]byte, error) {
 	fileBytes, err := os.ReadFile(fileName)
 	if err != nil {
-		handleErr("Error reading file: %s\n", err)
+		return nil, err
 	}
 
 	// create the blob content
@@ -131,26 +199,21 @@ func RunHashObject(fileName string) {
 	content := []byte(header)
 	content = append(content, fileBytes...)
 
-	hash, err := compressContent(content)
-	if err != nil {
-		handleErr("Failed to compress content %s: %v\n", hash, err)
-	}
-
-	fmt.Print(hash)
+	return compressContent(content)
 }
 
-func RunCatFile(hash string) {
+func GetBlobObject(hash string) (string, error) {
 	blob, err := uncompressObject(hash)
 	if err != nil {
-		handleErr("Failed to uncompress object %s: %v\n", hash, err)
+		return "", err
 	}
 
 	parts := strings.SplitN(string(blob), "\x00", 2)
 	if len(parts) != 2 {
-		handleErr("Invalid blob\n")
-		return
+		return "", fmt.Errorf("invalid blob")
 	}
-	fmt.Print(parts[1])
+
+	return parts[1], nil
 }
 
 func RunInit() {
@@ -190,23 +253,46 @@ func main() {
 		if len(os.Args) < 4 || os.Args[2] != "-p" {
 			handleErr("usage: mygit cat-file -p <sha1-hash>\n")
 		}
-		RunCatFile(os.Args[3])
+
+		hash, err := GetBlobObject(os.Args[3])
+		if err != nil {
+			handleErr("Failed to read blob object: %v\n", err)
+		}
+		fmt.Print(hash)
 
 	case "hash-object":
 		if len(os.Args) < 4 || os.Args[2] != "-w" {
 			handleErr("usage: mygit hash-object -w <sha1-hash>\n")
 		}
-		RunHashObject(os.Args[3])
+
+		hashBytes, err := CreateBlobObject(os.Args[3])
+		if err != nil {
+			handleErr("Failed to create blob object: %v\n", err)
+		}
+		fmt.Printf("%x\n", hashBytes)
 
 	case "ls-tree":
 		if len(os.Args) < 3 {
 			handleErr("usage: mygit ls-tree (--name-only) <tree-sha>\n")
 		}
+
 		if len(os.Args) == 3 {
-			RunLsTree(os.Args[2], false)
+			GetTreeObject(os.Args[2], false)
 		} else {
-			RunLsTree(os.Args[3], os.Args[2] == "--name-only")
+			GetTreeObject(os.Args[3], os.Args[2] == "--name-only")
 		}
+
+	case "write-tree":
+		dir, err := os.Getwd()
+		if err != nil {
+			handleErr("%s\n", err)
+		}
+
+		hashBytes, err := CreateTreeObject(dir)
+		if err != nil {
+			handleErr("Failed to create blob object: %v\n", err)
+		}
+		fmt.Printf("%x\n", hashBytes)
 
 	default:
 		handleErr("Unknown command %s\n", command)
