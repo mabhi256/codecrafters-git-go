@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 func uncompressObject(hash string) ([]byte, error) {
@@ -72,53 +73,27 @@ func compressContent(content []byte) ([]byte, error) {
 	return hashBytes[:], nil
 }
 
-func GetTreeObject(treeSha string, isNameOnly bool) {
-	blob, err := uncompressObject(treeSha)
-	if err != nil {
-		handleErr("Failed to uncompress object %s: %v\n", treeSha, err)
-	}
+func CreateCommitObject(treeSha string, parentSha string, message string) ([]byte, error) {
+	tree := fmt.Sprintf("tree %s\n", treeSha)
+	parent := fmt.Sprintf("parent %s\n", parentSha)
 
-	nullPos := bytes.IndexByte(blob, '\x00')
-	header := string(blob[:nullPos])
-	treeContent := blob[nullPos+1:]
+	user := "User <user@gmail.com>"
+	now := time.Now()
+	offset := now.Format("-0700")
+	author := fmt.Sprintf("author %s %d %s\n", user, now.Unix(), offset)
+	commiter := fmt.Sprintf("commiter %s %d %s\n", user, now.Unix(), offset)
 
-	if !strings.HasPrefix(header, "tree") {
-		handleErr("Invalid tree object: %s\n", treeSha)
-	}
+	message = fmt.Sprintf("\n%s\n", message)
 
-	i := 0
-	for i < len(treeContent) {
-		// find space for mode
-		spacePos := bytes.IndexByte(treeContent[i:], ' ')
-		mode := string(treeContent[i : i+spacePos])
-		i += spacePos + 1
+	body := tree + parent + author + commiter + message
 
-		// find null byte for object name
-		nullPos := bytes.IndexByte(treeContent[i:], '\x00')
-		objectName := string(treeContent[i : i+nullPos])
-		i += nullPos + 1
+	// create the commit object
+	bodyBytes := []byte(body)
+	header := fmt.Sprintf("commit %d\x00", len(bodyBytes))
+	content := []byte(header)
+	content = append(content, bodyBytes...)
 
-		// 20-byte SHA
-		sha := treeContent[i : i+20]
-		i += 20
-
-		if isNameOnly {
-			fmt.Println(objectName)
-		} else {
-			var objectType string
-
-			switch mode {
-			case "100644", "100755", "120000":
-				objectType = "blob"
-			case "040000":
-				objectType = "tree"
-			default:
-				objectType = "commit"
-			}
-
-			fmt.Printf("%s %s %x %s\n", mode, objectType, sha, objectName)
-		}
-	}
+	return compressContent(content)
 }
 
 func CreateTreeObject(path string) ([]byte, error) {
@@ -186,6 +161,55 @@ func getFileMode(entry os.DirEntry) string {
 	}
 
 	return "100644"
+}
+
+func GetTreeObject(treeSha string, isNameOnly bool) {
+	blob, err := uncompressObject(treeSha)
+	if err != nil {
+		handleErr("Failed to uncompress object %s: %v\n", treeSha, err)
+	}
+
+	nullPos := bytes.IndexByte(blob, '\x00')
+	header := string(blob[:nullPos])
+	treeContent := blob[nullPos+1:]
+
+	if !strings.HasPrefix(header, "tree") {
+		handleErr("Invalid tree object: %s\n", treeSha)
+	}
+
+	i := 0
+	for i < len(treeContent) {
+		// find space for mode
+		spacePos := bytes.IndexByte(treeContent[i:], ' ')
+		mode := string(treeContent[i : i+spacePos])
+		i += spacePos + 1
+
+		// find null byte for object name
+		nullPos := bytes.IndexByte(treeContent[i:], '\x00')
+		objectName := string(treeContent[i : i+nullPos])
+		i += nullPos + 1
+
+		// 20-byte SHA
+		sha := treeContent[i : i+20]
+		i += 20
+
+		if isNameOnly {
+			fmt.Println(objectName)
+		} else {
+			var objectType string
+
+			switch mode {
+			case "100644", "100755", "120000":
+				objectType = "blob"
+			case "040000":
+				objectType = "tree"
+			default:
+				objectType = "commit"
+			}
+
+			fmt.Printf("%s %s %x %s\n", mode, objectType, sha, objectName)
+		}
+	}
 }
 
 func CreateBlobObject(fileName string) ([]byte, error) {
@@ -289,6 +313,17 @@ func main() {
 		}
 
 		hashBytes, err := CreateTreeObject(dir)
+		if err != nil {
+			handleErr("Failed to create blob object: %v\n", err)
+		}
+		fmt.Printf("%x\n", hashBytes)
+
+	case "commit-tree":
+		if len(os.Args) < 7 {
+			handleErr("usage: mygit commit-tree <tree_sha> -p <commit_sha> -m <message>\n")
+		}
+
+		hashBytes, err := CreateCommitObject(os.Args[2], os.Args[4], os.Args[6])
 		if err != nil {
 			handleErr("Failed to create blob object: %v\n", err)
 		}
